@@ -4,6 +4,8 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+#include <list>
+#include <map>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -17,17 +19,46 @@
 
 template<class T> class workbit {
 public:
+  struct bitstat_t {
+    uint64_t send_retry;
+    uint64_t send_count;
+    uint64_t recv_count;
+    size_t sent_bytes;
+    size_t recv_bytes;
+    void reset() {
+      sent_bytes = recv_bytes = 0;
+      send_retry = send_count = recv_count = 0;
+    }
+  };
   enum fd_state_t {
-    STATE_LISTEN = 0x100000000L,
-    STATE_CONNECTING = 0x200000000L,
-    STATE_CONNECTED  = 0x300000000L,
-    STATE_CTRL       = 0x400000000L,
+    STATE_INVALID    = 0,
+    STATE_LISTEN     = 1,
+    STATE_CONNECTING = 2,
+    STATE_CONNECTED  = 3,
+    STATE_CTRL       = 4,
+  };
+  typedef void(*write_cb_t)(void* parm, int fd, void* data);
+  struct write_req_t {
+    void* data;
+    size_t off;
+    size_t len;
+    write_cb_t cb;
+    void* parm;
+  };
+  struct connection_t {
+    fd_state_t state;
+    int fd;
+    std::list<write_req_t> write_queue;
+    void* extra;
+    connection_t(int _fd, fd_state_t _state):fd(_fd), state(_state),
+      extra(NULL){}
   };
   workbit():_stop(true), _epfd(-1){}
 
   bool start() {
     if (!_stop)
       return true;
+    _stat.reset();
     _epfd = epoll_create(1); //the input is not used
     if (_epfd > 0) {
       _stop = false;
@@ -42,8 +73,10 @@ public:
         _writefd = pair[1];
         struct epoll_event ev;
         ev.events = EPOLLIN;
-        ev.data.u64 = STATE_CTRL | (0xffffffff & _readfd);
+        connection_t* pconn = new connection_t(_readfd, STATE_CTRL);
+        ev.data.ptr = pconn;
         if (epoll_ctl(_epfd, EPOLL_CTL_ADD, _readfd, &ev) < 0) {
+          delete pconn;
           close(_epfd);
           close(_readfd);
           close(_writefd);
@@ -60,6 +93,8 @@ public:
     write(_writefd, " ", 1);
     _future_stop.get();
     close(_epfd);
+    close(_readfd);
+    close(_writefd);
     return true;
   }
 
@@ -79,9 +114,12 @@ public:
  
     struct epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.u64 = STATE_LISTEN | (0xffffffff & sockfd);
-    if (epoll_ctl(_epfd, EPOLL_CTL_ADD, sockfd, &ev) < 0)
+    connection_t* pconn = new connection_t(sockfd, STATE_LISTEN);
+    ev.data.ptr = pconn; 
+    if (epoll_ctl(_epfd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
+      delete pconn;
       return -1;
+    }
     return 0;
   }
 
@@ -105,13 +143,63 @@ public:
     } else {
       struct epoll_event ev;
       ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-      ev.data.u64 = STATE_CONNECTING | (0xffffffff & c_fd);
+      connection_t *pconn = new connection_t(c_fd, STATE_CONNECTING);
+      ev.data.ptr = pconn;
       if ( epoll_ctl(_epfd, EPOLL_CTL_ADD, c_fd, &ev) < 0) {
+        delete pconn;
         close(c_fd);
         return -1;
       }
       return 1;
     }
+  }
+
+  int prepare_close(int fd) {
+    if (_conns.find(fd) == _conns.end())
+      return -1;
+
+    connection_t* pconn = _conns[fd];
+    write_req_t req;
+    req.data = NULL;
+    req.parm = NULL;
+    req.cb = NULL;
+    req.len = 0;
+    req.off = 0;
+    pconn->write_queue.push_back(req);
+    return 0;
+  }
+
+  int request(int fd, size_t len, void* data, write_cb_t cb, void* parm) {
+    if (_conns.find(fd) == _conns.end()) 
+      return -1;
+
+    connection_t* pconn = _conns[fd];
+    int r = 0;
+    if (pconn->write_queue.size()>0) {
+      r = -1;
+    } else {
+      r = write(fd, data, len);
+    }
+    if (r < 0 || r != len) {
+      if (r < len || errno == EAGAIN || errno == EWOULDBLOCK) {
+        write_req_t req;
+        req.data = data;
+        req.parm = parm;
+        req.cb = cb;
+        req.len = len;
+        req.off = (r > 0) ? r:0;
+        pconn->write_queue.push_back(req);
+        return len;
+      }
+    } else {
+      _stat.sent_bytes += r;
+      cb(parm, fd, data);
+    }
+    return r;
+  }
+
+  bitstat_t get_stat() const {
+    return _stat;
   }
 
 private:
@@ -120,9 +208,11 @@ private:
     if (flag < 0) return -1;
     return fcntl(fd, F_SETFL, flag | O_NONBLOCK);
   }
+
   static int _loop(workbit* wb) {
     return wb->__loop();
   }
+
   int __loop() {
     struct epoll_event evs[1000];
     int status, err;
@@ -131,8 +221,8 @@ private:
       int n = epoll_wait( _epfd, evs, 20, -1);
       for (int i = 0; i<n; i++) {
         epoll_event& ev = evs[i];
-        uint64_t state = (ev.data.u64) & 0xf00000000L;
-        switch (state) {
+        connection_t* pconn = (connection_t*)ev.data.ptr;
+        switch (pconn->state) {
         case STATE_CONNECTED: _handle_connected(ev); break;
         case STATE_LISTEN: _handle_listen(ev); break;
         case STATE_CONNECTING: _handle_connecting(ev); break;
@@ -144,27 +234,39 @@ private:
   }
 
   int _handle_ctrl(epoll_event& ev) {
+    uint8_t bv;
+    read(_readfd, &bv, 1);
     _stop = true;
   }
 
   int _handle_listen(epoll_event& ev) {
-    int listen_sock = (ev.data.u64 & 0xffffffff);
+    connection_t& lconn = *(connection_t*)ev.data.ptr;
+    int listen_sock = lconn.fd;
     struct sockaddr_in client_addr;
     socklen_t len = sizeof(client_addr);
     int conn_sock = accept(listen_sock, (struct sockaddr*)&client_addr,
                            &len);
-    if (conn_sock < 0) return -1;
-    if (_setnonblocking(conn_sock) < 0) return -1;
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.u64 = STATE_CONNECTED | (0xffffffff & conn_sock);
-    if (epoll_ctl( _epfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) return -1;
-    static_cast<T*>(this)->connection_accepted(conn_sock, (struct sockaddr*)&client_addr);
+    if (conn_sock < 0)
+      return -1;
+    if (_setnonblocking(conn_sock) < 0)
+      return -1;
+    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+    connection_t* pconn = new connection_t(conn_sock, STATE_CONNECTED);
+    ev.data.ptr = pconn;
+    _conns[conn_sock] = pconn;
+    if (epoll_ctl( _epfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1){
+      delete pconn;
+      return -1;
+    }
+    pconn->extra = static_cast<T*>(this)->connection_accepted(conn_sock, 
+        (struct sockaddr*)&client_addr);
     return 0;
   }
 
   int _handle_connecting(epoll_event &ev) {
     int events = ev.events;
-    int c_fd = (ev.data.u64 & 0xffffffff);
+    connection_t* pconn = (connection_t*)ev.data.ptr;
+    int c_fd = pconn->fd;
     if (events & EPOLLERR) {
       int err = 0;
       socklen_t len = sizeof(err);
@@ -174,28 +276,52 @@ private:
       return 0;
     }
     if (events & EPOLLOUT) {
-      ev.data.u64 = STATE_CONNECTED | (0xffffffff & c_fd);
-      ev.events = (EPOLLIN | EPOLLOUT | EPOLLET);
-      if ( epoll_ctl( _epfd, EPOLL_CTL_MOD, c_fd, &ev) < 0) {
-        close(c_fd);
-      } else {
-        static_cast<T*>(this)->connection_made(c_fd);
-      }
+      pconn->state = STATE_CONNECTED;
+      _conns[c_fd] = pconn;
+      pconn->extra = static_cast<T*>(this)->connection_made(c_fd);
     }
     return 0;
   }
         
   int _handle_connected(epoll_event &ev) {
+    connection_t* pconn = (connection_t*)ev.data.ptr;
     int events = ev.events;
-    int c_fd = (ev.data.u64 & 0xffffffff);
+    int c_fd = pconn->fd;
     if (events & EPOLLERR) {
       int err = 0;
       socklen_t len = sizeof(err);
       int ret = getsockopt(c_fd, SOL_SOCKET, SO_ERROR, &err, &len);
       epoll_ctl( _epfd, EPOLL_CTL_DEL, c_fd, &ev);
       close(c_fd);
-      static_cast<T*>(this)->connection_lost(c_fd);
+      static_cast<T*>(this)->connection_closed(*pconn);
       return 0;
+    }
+    if (events & EPOLLOUT) {
+      int r = 0;
+      while(pconn->write_queue.size()>0 && r >= 0) {
+        write_req_t& req = pconn->write_queue.front();
+        if (req.data != NULL) {
+          int to_write = req.len - req.off;
+          if (to_write == 0) {
+            pconn->write_queue.pop_front();
+            continue;
+          }
+          r = write(c_fd, (uint8_t*)req.data + req.off, to_write);
+          if (r > 0) {
+            _stat.sent_bytes += r;
+            req.off += r;
+          }
+          if (r == to_write) {
+            if (req.cb)
+              req.cb(req.parm, c_fd, req.data);
+            pconn->write_queue.pop_front();
+          }
+        } else {
+          r = -1;
+          pconn->write_queue.pop_front();
+          close(c_fd);
+        }
+      }
     }
     if (events & EPOLLIN) {
       size_t len = 0;
@@ -203,26 +329,28 @@ private:
       int cnt = 0;
       do {
         cnt = read(c_fd, buf, len);
-        if (cnt > 0)
-          static_cast<T*>(this)->data(c_fd, cnt, buf);
+        if (cnt >= 0) {
+          static_cast<T*>(this)->data(*pconn, cnt, buf);
+          _stat.recv_count += 1;
+          _stat.recv_bytes += cnt;
+        }
       } while (cnt > 0);
       static_cast<T*>(this)->release_buf(c_fd, buf);
       if (cnt == 0) {
-        epoll_ctl( _epfd, EPOLL_CTL_DEL, c_fd, &ev);
-        close(c_fd);
-        static_cast<T*>(this)->connection_lost(c_fd);
-      } else {
-        ev.events = (EPOLLIN | EPOLLOUT | EPOLLET);
-        epoll_ctl(_epfd, EPOLL_CTL_MOD, c_fd, &ev);
+        ev.events = EPOLLOUT | EPOLLERR;
+        epoll_ctl( _epfd, EPOLL_CTL_MOD, c_fd, &ev);
+        static_cast<T*>(this)->connection_closed(*pconn);
       }
     }
-  }
 
+  }
+  
   std::future<int> _future_stop;
   bool _stop;
   int _epfd;
   int _readfd;
   int _writefd;
+  bitstat_t _stat;
+  std::map<int, connection_t*> _conns;
 };
-
 

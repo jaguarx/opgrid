@@ -44,14 +44,16 @@ public:
     size_t len;
     write_cb_t cb;
     void* parm;
+    write_req_t():data(NULL), off(0), len(0), cb(NULL), parm(NULL){}
   };
   struct connection_t {
     fd_state_t state;
     int fd;
+    int shutdown_flag;
     std::list<write_req_t> write_queue;
     void* extra;
     connection_t(int _fd, fd_state_t _state):fd(_fd), state(_state),
-      extra(NULL){}
+      shutdown_flag(0), extra(NULL){}
   };
   workbit():_stop(true), _epfd(-1){}
 
@@ -82,6 +84,7 @@ public:
           close(_writefd);
           return -1;
         }
+        _conns[_readfd] = pconn;
       }
       std::thread(std::move(task), this).detach();
     }
@@ -101,6 +104,11 @@ public:
   int prepare_listen(const char* host, int port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) return -1;
+
+    int flag = 1;
+    if (setsockopt (sockfd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag) ) < 0)
+      return -1;
+
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
@@ -120,6 +128,7 @@ public:
       delete pconn;
       return -1;
     }
+    _conns[sockfd] = pconn;
     return 0;
   }
 
@@ -142,7 +151,7 @@ public:
       return -1;
     } else {
       struct epoll_event ev;
-      ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+      ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
       connection_t *pconn = new connection_t(c_fd, STATE_CONNECTING);
       ev.data.ptr = pconn;
       if ( epoll_ctl(_epfd, EPOLL_CTL_ADD, c_fd, &ev) < 0) {
@@ -160,11 +169,6 @@ public:
 
     connection_t* pconn = _conns[fd];
     write_req_t req;
-    req.data = NULL;
-    req.parm = NULL;
-    req.cb = NULL;
-    req.len = 0;
-    req.off = 0;
     pconn->write_queue.push_back(req);
     return 0;
   }
@@ -230,9 +234,24 @@ private:
         }
       }
     }
+    for (std::pair<int, connection_t*> item :_conns) {
+      delete item.second;
+      close(item.first);
+    }
+    _conns.clear();
     return 0;
   }
 
+  int _cleanup_connection(connection_t* pconn, int flag) {
+    pconn->shutdown_flag |= flag;
+    if (pconn->shutdown_flag == (SHUT_RD | SHUT_WR)) {
+      _conns.erase(pconn->fd);
+      close(pconn->fd);
+      delete pconn;
+      return 0;
+    }
+    return pconn->fd;
+  }
   int _handle_ctrl(epoll_event& ev) {
     uint8_t bv;
     read(_readfd, &bv, 1);
@@ -250,7 +269,7 @@ private:
       return -1;
     if (_setnonblocking(conn_sock) < 0)
       return -1;
-    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+    ev.events = EPOLLIN | EPOLLET | EPOLLOUT | EPOLLRDHUP;
     connection_t* pconn = new connection_t(conn_sock, STATE_CONNECTED);
     ev.data.ptr = pconn;
     _conns[conn_sock] = pconn;
@@ -287,6 +306,7 @@ private:
     connection_t* pconn = (connection_t*)ev.data.ptr;
     int events = ev.events;
     int c_fd = pconn->fd;
+    int flag = 0;
     if (events & EPOLLERR) {
       int err = 0;
       socklen_t len = sizeof(err);
@@ -294,55 +314,22 @@ private:
       epoll_ctl( _epfd, EPOLL_CTL_DEL, c_fd, &ev);
       close(c_fd);
       static_cast<T*>(this)->connection_closed(*pconn);
+      _conns.erase(c_fd);
+      delete pconn;
       return 0;
     }
     if (events & EPOLLOUT) {
-      int r = 0;
-      while(pconn->write_queue.size()>0 && r >= 0) {
-        write_req_t& req = pconn->write_queue.front();
-        if (req.data != NULL) {
-          int to_write = req.len - req.off;
-          if (to_write == 0) {
-            pconn->write_queue.pop_front();
-            continue;
-          }
-          r = write(c_fd, (uint8_t*)req.data + req.off, to_write);
-          if (r > 0) {
-            _stat.sent_bytes += r;
-            req.off += r;
-          }
-          if (r == to_write) {
-            if (req.cb)
-              req.cb(req.parm, c_fd, req.data);
-            pconn->write_queue.pop_front();
-          }
-        } else {
-          r = -1;
-          pconn->write_queue.pop_front();
-          close(c_fd);
-        }
-      }
+      static_cast<T*>(this)->writable(*pconn);
     }
     if (events & EPOLLIN) {
-      size_t len = 0;
-      void* buf = static_cast<T*>(this)->allocate_buf(c_fd, len);
-      int cnt = 0;
-      do {
-        cnt = read(c_fd, buf, len);
-        if (cnt >= 0) {
-          static_cast<T*>(this)->data(*pconn, cnt, buf);
-          _stat.recv_count += 1;
-          _stat.recv_bytes += cnt;
-        }
-      } while (cnt > 0);
-      static_cast<T*>(this)->release_buf(c_fd, buf);
-      if (cnt == 0) {
-        ev.events = EPOLLOUT | EPOLLERR;
-        epoll_ctl( _epfd, EPOLL_CTL_MOD, c_fd, &ev);
-        static_cast<T*>(this)->connection_closed(*pconn);
-      }
+      static_cast<T*>(this)->readable(*pconn);
     }
-
+    if (events & EPOLLRDHUP) {
+      static_cast<T*>(this)->connection_closed(*pconn);
+    }
+    if (flag != 0) {
+      _cleanup_connection(pconn, flag);
+    }
   }
   
   std::future<int> _future_stop;
